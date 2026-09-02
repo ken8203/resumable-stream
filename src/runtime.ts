@@ -9,6 +9,7 @@ interface CreateResumableStreamContext {
   waitUntil: (promise: Promise<unknown>) => void;
   subscriber: Subscriber;
   publisher: Publisher;
+  doneWatchdogIntervalMs?: number;
 }
 
 export function createResumableStreamContextFactory(defaults: _Private.RedisDefaults) {
@@ -21,6 +22,7 @@ export function createResumableStreamContextFactory(defaults: _Private.RedisDefa
       waitUntil,
       subscriber: options.subscriber,
       publisher: options.publisher,
+      doneWatchdogIntervalMs: options.doneWatchdogIntervalMs,
     } as CreateResumableStreamContext;
     let initPromises: Promise<unknown>[] = [];
 
@@ -106,6 +108,8 @@ interface ResumeStreamMessage {
 const DONE_MESSAGE = "\n\n\nDONE_SENTINEL_hasdfasudfyge374%$%^$EDSATRTYFtydryrte\n";
 
 const DONE_VALUE = "DONE";
+
+const DEFAULT_DONE_WATCHDOG_INTERVAL_MS = 10_000;
 
 async function resumeExistingStream(
   initPromise: Promise<unknown>,
@@ -254,17 +258,94 @@ export async function resumeStream(
 ): Promise<ReadableStream<string> | null> {
   const listenerId = crypto.randomUUID();
   return new Promise<ReadableStream<string> | null>((resolve, reject) => {
+    const chunkChannel = `${ctx.keyPrefix}:chunk:${listenerId}`;
+    const sentinelKey = `${ctx.keyPrefix}:sentinel:${streamId}`;
+    const watchdogIntervalMs = ctx.doneWatchdogIntervalMs ?? DEFAULT_DONE_WATCHDOG_INTERVAL_MS;
+    let ackTimeout: ReturnType<typeof setTimeout> | undefined;
+    let watchdogTimeout: ReturnType<typeof setTimeout> | undefined;
+    let cleanupPromise: Promise<unknown> | undefined;
+
+    const cleanup = () => {
+      if (cleanupPromise) {
+        return cleanupPromise;
+      }
+
+      clearTimeout(ackTimeout);
+      clearTimeout(watchdogTimeout);
+      cleanupPromise = Promise.resolve().then(() => ctx.subscriber.unsubscribe(chunkChannel));
+      return cleanupPromise;
+    };
+
     const readableStream = new ReadableStream<string>({
       async start(controller) {
         try {
           debugLog("STARTING STREAM", streamId, listenerId);
-          const cleanup = async () => {
-            await ctx.subscriber.unsubscribe(`${ctx.keyPrefix}:chunk:${listenerId}`);
+          // The DONE control message travels over pub/sub, which is fire-and-forget: if that one
+          // message is lost (e.g. the subscriber connection dropped and reconnected at the wrong
+          // moment, or the producer died between writing the DONE sentinel and publishing), this
+          // stream would stay open forever even though the durable sentinel already says DONE.
+          // Re-check the sentinel periodically and close once the producer is finished or the
+          // sentinel expired. Closing requires two consecutive DONE observations so in-flight
+          // messages get a full interval to drain before we give up on them.
+          let doneObservations = 0;
+          let watchdogStarted = false;
+          const closeStream = () => {
+            try {
+              controller.close();
+            } catch (e) {
+              // The stream may already be closed because the client disconnected.
+              if (isDebug()) {
+                console.error(e);
+              }
+            }
           };
+          const scheduleDoneWatchdog = () => {
+            if (cleanupPromise) {
+              return;
+            }
+            watchdogTimeout = setTimeout(checkDone, watchdogIntervalMs);
+          };
+          const startDoneWatchdog = () => {
+            if (watchdogStarted) {
+              return;
+            }
+            watchdogStarted = true;
+            scheduleDoneWatchdog();
+          };
+          async function checkDone() {
+            try {
+              const val = await ctx.publisher.get(sentinelKey);
+              if (val !== DONE_VALUE && val !== null) {
+                doneObservations = 0;
+                return;
+              }
+
+              doneObservations += 1;
+              if (doneObservations < 2) {
+                return;
+              }
+
+              debugLog(
+                "done watchdog: sentinel is done but no DONE message arrived; closing",
+                streamId,
+                listenerId
+              );
+              closeStream();
+              await cleanup();
+            } catch (e) {
+              // A transient sentinel read failure must not kill the stream. Cleanup failures are
+              // also contained here because timer callbacks cannot surface rejected promises.
+              if (isDebug()) {
+                console.error(e);
+              }
+            } finally {
+              scheduleDoneWatchdog();
+            }
+          }
           const start = Date.now();
-          const timeout = setTimeout(async () => {
+          ackTimeout = setTimeout(async () => {
             await cleanup();
-            const val = await ctx.publisher.get(`${ctx.keyPrefix}:sentinel:${streamId}`);
+            const val = await ctx.publisher.get(sentinelKey);
             if (val === DONE_VALUE) {
               resolve(null);
             }
@@ -273,40 +354,29 @@ export async function resumeStream(
               reject(new Error("Timeout waiting for ack"));
             }
           }, 1000);
-          await ctx.subscriber.subscribe(
-            `${ctx.keyPrefix}:chunk:${listenerId}`,
-            async (message: string) => {
-              debugLog("Received message", message);
-              // The other side always sends a message even if it is the empty string.
-              clearTimeout(timeout);
-              resolve(readableStream);
-              if (message === DONE_MESSAGE) {
-                try {
-                  controller.close();
-                } catch (e) {
-                  // errors can e.g. happen if the stream is already closed
-                  // because the client has disconnected
-                  // ignore them unless we are in debug mode
-                  if (isDebug()) {
-                    console.error(e);
-                  }
-                }
-                await cleanup();
-                return;
-              }
-              try {
-                controller.enqueue(message);
-              } catch (e) {
-                // errors can e.g. happen if the stream is already closed
-                // because the client has disconnected
-                // ignore them unless we are in debug mode
-                if (isDebug()) {
-                  console.error(e);
-                }
-                await cleanup();
-              }
+          await ctx.subscriber.subscribe(chunkChannel, async (message: string) => {
+            debugLog("Received message", message);
+            // The other side always sends a message even if it is the empty string.
+            clearTimeout(ackTimeout);
+            resolve(readableStream);
+            if (message === DONE_MESSAGE) {
+              closeStream();
+              await cleanup();
+              return;
             }
-          );
+            startDoneWatchdog();
+            try {
+              controller.enqueue(message);
+            } catch (e) {
+              // errors can e.g. happen if the stream is already closed
+              // because the client has disconnected
+              // ignore them unless we are in debug mode
+              if (isDebug()) {
+                console.error(e);
+              }
+              await cleanup();
+            }
+          });
           await ctx.publisher.publish(
             `${ctx.keyPrefix}:request:${streamId}`,
             JSON.stringify({
@@ -315,8 +385,18 @@ export async function resumeStream(
             })
           );
         } catch (e) {
+          try {
+            await cleanup();
+          } catch (cleanupError) {
+            if (isDebug()) {
+              console.error(cleanupError);
+            }
+          }
           reject(e);
         }
+      },
+      async cancel() {
+        await cleanup();
       },
     });
   });
